@@ -1,7 +1,20 @@
 const express = require('express');
 const mysql = require('mysql2/promise');
 const app = express();
-app.use(express.json());
+
+app.use((req, res, next) => {
+  let data = '';
+  req.on('data', chunk => data += chunk);
+  req.on('end', () => {
+    try {
+      req.body = JSON.parse(data);
+    } catch(e) {
+      const clean = data.replace(/[\x00-\x1F\x7F]/g, ' ');
+      try { req.body = JSON.parse(clean); } catch(e2) { req.body = {}; }
+    }
+    next();
+  });
+});
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST,
@@ -17,7 +30,9 @@ app.post('/api/sms_receive.php', async (req, res) => {
     return res.status(401).json({success: false, message: 'Invalid token'});
   }
 
-  const { sender, message } = req.body;
+  const sender = String(req.body.sender || '').replace(/[\x00-\x1F\x7F]/g, ' ');
+  const message = String(req.body.message || '').replace(/[\x00-\x1F\x7F]/g, ' ');
+
   if (!sender || !message) {
     return res.status(400).json({success: false, message: 'sender and message required'});
   }
@@ -82,6 +97,7 @@ app.post('/api/sms_receive.php', async (req, res) => {
     return res.json({success: true, matched: true, status: 'confirmed'});
 
   } catch(e) {
+    console.error(e);
     return res.status(500).json({success: false, message: e.message});
   }
 });
