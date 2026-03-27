@@ -1,5 +1,5 @@
 const express = require('express');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');
 const app = express();
 
 app.use((req, res, next) => {
@@ -16,13 +16,22 @@ app.use((req, res, next) => {
   });
 });
 
-const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASS,
-  database: process.env.DB_NAME,
-  port: 3306
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
+
+pool.query(`
+  CREATE TABLE IF NOT EXISTS sms_log (
+    id SERIAL PRIMARY KEY,
+    sender TEXT,
+    message TEXT,
+    txn_id_extracted TEXT,
+    amount_extracted NUMERIC,
+    matched_payment_id INT,
+    received_at TIMESTAMP DEFAULT NOW()
+  )
+`).catch(console.error);
 
 app.post('/api/sms_receive.php', async (req, res) => {
   const token = req.headers['x-app-token'] || '';
@@ -40,68 +49,53 @@ app.post('/api/sms_receive.php', async (req, res) => {
   let trx_id = null;
   let amount = null;
 
-  const trxPatterns = [
-    /TrxID\s+([A-Z0-9]+)/i,
-    /Tran\s*ID[:\s]+([A-Z0-9]+)/i,
-    /Transaction\s*ID[:\s]+([A-Z0-9]+)/i,
-  ];
+  const trxPatterns = [/TrxID\s+([A-Z0-9]+)/i, /Tran\s*ID[:\s]+([A-Z0-9]+)/i, /Transaction\s*ID[:\s]+([A-Z0-9]+)/i];
   for (const p of trxPatterns) {
     const m = message.match(p);
     if (m) { trx_id = m[1].toUpperCase(); break; }
   }
 
-  const amtPatterns = [
-    /Tk\.?\s*([\d,]+\.?\d*)/i,
-    /BDT\s*([\d,]+\.?\d*)/i,
-    /Amount[:\s]+([\d,]+\.?\d*)/i,
-  ];
+  const amtPatterns = [/Tk\.?\s*([\d,]+\.?\d*)/i, /BDT\s*([\d,]+\.?\d*)/i, /Amount[:\s]+([\d,]+\.?\d*)/i];
   for (const p of amtPatterns) {
     const m = message.match(p);
     if (m) { amount = parseFloat(m[1].replace(',','')); break; }
   }
 
-  try {
-    await pool.execute(
-      'INSERT INTO sms_log (sender, message, txn_id_extracted, amount_extracted) VALUES (?,?,?,?)',
-      [sender, message, trx_id, amount]
-    );
+  await pool.query('INSERT INTO sms_log (sender, message, txn_id_extracted, amount_extracted) VALUES ($1,$2,$3,$4)', [sender, message, trx_id, amount]);
 
-    if (!trx_id) {
-      return res.json({success: true, matched: false, reason: 'TrxID parse করা যায়নি'});
-    }
+  console.log('SMS received:', sender, '| TrxID:', trx_id, '| Amount:', amount);
 
-    const [rows] = await pool.execute(
-      "SELECT * FROM payment_requests WHERE txn_id = ? AND status = 'pending' LIMIT 1",
-      [trx_id]
-    );
+  if (!trx_id) return res.json({success: true, matched: false, reason: 'TrxID নেই'});
 
-    if (rows.length === 0) {
-      return res.json({success: true, matched: false, reason: 'No matching payment'});
-    }
+  // InfinityFree MySQL তে confirm করো
+  const mysql = require('mysql2/promise');
+  const db = await mysql.createConnection({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME
+  });
 
-    const payment = rows[0];
-
-    if (amount && Math.abs(amount - parseFloat(payment.amount)) > 1) {
-      await pool.execute(
-        "UPDATE payment_requests SET status='failed', sms_matched=? WHERE id=?",
-        [message, payment.id]
-      );
-      return res.json({success: true, matched: true, status: 'failed', reason: 'Amount mismatch'});
-    }
-
-    await pool.execute(
-      "UPDATE payment_requests SET status='confirmed', sms_matched=? WHERE id=?",
-      [message, payment.id]
-    );
-
-    return res.json({success: true, matched: true, status: 'confirmed'});
-
-  } catch(e) {
-    console.error(e);
-    return res.status(500).json({success: false, message: e.message});
+  const [rows] = await db.execute("SELECT * FROM payment_requests WHERE txn_id = ? AND status = 'pending' LIMIT 1", [trx_id]);
+  
+  if (rows.length === 0) {
+    await db.end();
+    return res.json({success: true, matched: false, reason: 'Payment নেই'});
   }
+
+  const payment = rows[0];
+
+  if (amount && Math.abs(amount - parseFloat(payment.amount)) > 1) {
+    await db.execute("UPDATE payment_requests SET status='failed', sms_matched=? WHERE id=?", [message, payment.id]);
+    await db.end();
+    return res.json({success: true, matched: true, status: 'failed'});
+  }
+
+  await db.execute("UPDATE payment_requests SET status='confirmed', sms_matched=? WHERE id=?", [message, payment.id]);
+  await db.end();
+
+  return res.json({success: true, matched: true, status: 'confirmed'});
 });
 
 app.get('/', (req, res) => res.send('Arena SMS Relay OK'));
-
 app.listen(process.env.PORT || 3000, () => console.log('Server running'));
