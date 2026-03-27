@@ -2,11 +2,10 @@
   "name": "arena-sms-relay",
   "version": "1.0.0",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
+  "scripts": { "start": "node index.js" },
   "dependencies": {
     "express": "^4.18.2",
-    "mysql2": "^3.6.0"
+    "mysql2": "^3.6.0",
+    "pg": "^8.11.0"
   }
 }
